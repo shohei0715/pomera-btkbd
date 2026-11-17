@@ -1,0 +1,8 @@
+#!/bin/sh
+# pomera-btkbd の操作: btkbd toggle|remote|local|pair|status
+# keydの無変換レイヤー(無変換+F10/F11)からも呼ばれる
+case "${1:-status}" in
+    toggle|remote|local|pair) printf '%s\n' "$1" > /run/pomera-btkbd/cmd ;;
+    status) cat /run/pomera-btkbd/state 2>/dev/null || echo "BT:停止中" ;;
+    *) echo "使い方: btkbd toggle|remote|local|pair|status" >&2; exit 2 ;;
+esac

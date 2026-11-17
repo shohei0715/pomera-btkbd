@@ -1,0 +1,511 @@
+#!/usr/bin/python3
+# pomera-btkbd: ポメラをBluetoothキーボード(クラシックHID)にする常駐デーモン。
+# keydで大西配列に入れ替えた後の「keyd virtual keyboard」を読み、相手端末へ送る。
+#   remoteモード: 入力デバイスを独占(EVIOCGRAB)してポメラ自身には文字を入れない
+#   localモード : 何もしない(ポメラで普通に使う)
+# 操作は /run/pomera-btkbd/cmd (FIFO) に toggle / remote / local / pair を書く(btkbdコマンド経由)。
+# 状態は /run/pomera-btkbd/state に1行で出す(screenのステータス表示用)。
+import fcntl, os, socket, struct, subprocess, sys, threading, time
+import dbus, dbus.service
+from dbus.mainloop.glib import DBusGMainLoop
+from gi.repository import GLib
+
+RUN = "/run/pomera-btkbd"
+STATE_FILE = RUN + "/state"
+CMD_FIFO = RUN + "/cmd"
+HOST_FILE = "/var/lib/pomera-btkbd/host"
+SAVED_BL = RUN + "/brightness"
+PSM_CTRL, PSM_INTR = 0x11, 0x13
+EVIOCGRAB = 0x40044590
+PAIR_SECONDS = 120
+
+# ブートキーボード(レポートID 1)+LED出力
+HID_DESC = "".join([
+    "05 01 09 06 a1 01 85 01",                          # Generic Desktop / Keyboard / Collection / Report ID 1
+    "05 07 19 e0 29 e7 15 00 25 01 75 01 95 08 81 02",  # 修飾キー 8bit
+    "95 01 75 08 81 01",                                # 予約 1byte
+    "95 05 75 01 05 08 19 01 29 05 91 02",              # LED出力 5bit
+    "95 01 75 03 91 01",                                # パディング 3bit
+    "95 06 75 08 15 00 26 ff 00 05 07 19 00 29 ff 81 00",  # キー 6byte (英数/かな=0x90/0x91を含むよう0xFFまで)
+    "c0",
+    # レポートID 2: Consumer Control 16bit (地球儀キー=AC Next Keyboard Layout Select 0x029D を送る用)
+    "05 0c 09 01 a1 01 85 02 15 00 26 ff 03 19 00 2a ff 03 75 10 95 01 81 00 c0",
+]).replace(" ", "")
+
+SDP_RECORD = """<?xml version="1.0" encoding="UTF-8" ?>
+<record>
+  <attribute id="0x0001"><sequence><uuid value="0x1124" /></sequence></attribute>
+  <attribute id="0x0004"><sequence>
+    <sequence><uuid value="0x0100" /><uint16 value="0x0011" /></sequence>
+    <sequence><uuid value="0x0011" /></sequence></sequence></attribute>
+  <attribute id="0x0005"><sequence><uuid value="0x1002" /></sequence></attribute>
+  <attribute id="0x0006"><sequence>
+    <uint16 value="0x656e" /><uint16 value="0x006a" /><uint16 value="0x0100" /></sequence></attribute>
+  <attribute id="0x0009"><sequence><sequence>
+    <uuid value="0x1124" /><uint16 value="0x0100" /></sequence></sequence></attribute>
+  <attribute id="0x000d"><sequence><sequence>
+    <sequence><uuid value="0x0100" /><uint16 value="0x0013" /></sequence>
+    <sequence><uuid value="0x0011" /></sequence></sequence></sequence></attribute>
+  <attribute id="0x0100"><text value="Pomera Keyboard" /></attribute>
+  <attribute id="0x0101"><text value="Pomera DM250 Oonishi keyboard" /></attribute>
+  <attribute id="0x0102"><text value="pomera" /></attribute>
+  <attribute id="0x0200"><uint16 value="0x0100" /></attribute>
+  <attribute id="0x0201"><uint16 value="0x0111" /></attribute>
+  <attribute id="0x0202"><uint8 value="0x40" /></attribute>
+  <attribute id="0x0203"><uint8 value="0x00" /></attribute>
+  <attribute id="0x0204"><boolean value="false" /></attribute>
+  <attribute id="0x0205"><boolean value="true" /></attribute>
+  <attribute id="0x0206"><sequence><sequence>
+    <uint8 value="0x22" /><text encoding="hex" value="%s" /></sequence></sequence></attribute>
+  <attribute id="0x0207"><sequence><sequence>
+    <uint16 value="0x0409" /><uint16 value="0x0100" /></sequence></sequence></attribute>
+  <attribute id="0x020b"><uint16 value="0x0100" /></attribute>
+  <attribute id="0x020c"><uint16 value="0x0c80" /></attribute>
+  <attribute id="0x020d"><boolean value="true" /></attribute>
+  <attribute id="0x020e"><boolean value="false" /></attribute>
+</record>""" % HID_DESC
+
+# Linuxのキーコード -> HID Usage ID
+KEYMAP = {
+    1: 0x29, 14: 0x2A, 15: 0x2B, 28: 0x28, 57: 0x2C, 58: 0x39,
+    2: 0x1E, 3: 0x1F, 4: 0x20, 5: 0x21, 6: 0x22, 7: 0x23, 8: 0x24, 9: 0x25, 10: 0x26, 11: 0x27,
+    12: 0x2D, 13: 0x2E, 26: 0x2F, 27: 0x30, 43: 0x31, 39: 0x33, 40: 0x34, 41: 0x35,
+    51: 0x36, 52: 0x37, 53: 0x38,
+    16: 0x14, 17: 0x1A, 18: 0x08, 19: 0x15, 20: 0x17, 21: 0x1C, 22: 0x18, 23: 0x0C, 24: 0x12, 25: 0x13,
+    30: 0x04, 31: 0x16, 32: 0x07, 33: 0x09, 34: 0x0A, 35: 0x0B, 36: 0x0D, 37: 0x0E, 38: 0x0F,
+    44: 0x1D, 45: 0x1B, 46: 0x06, 47: 0x19, 48: 0x05, 49: 0x11, 50: 0x10,
+    59: 0x3A, 60: 0x3B, 61: 0x3C, 62: 0x3D, 63: 0x3E, 64: 0x3F, 65: 0x40, 66: 0x41, 67: 0x42, 68: 0x43,
+    87: 0x44, 88: 0x45,
+    102: 0x4A, 103: 0x52, 104: 0x4B, 105: 0x50, 106: 0x4F, 107: 0x4D, 108: 0x51, 109: 0x4E,
+    110: 0x49, 111: 0x4C, 99: 0x46, 70: 0x47, 119: 0x48, 127: 0x65,
+    85: 0x35, 89: 0x87, 124: 0x89,
+}
+# 日本語入力の切替: 無変換(単独押し)・変換・カタカナひらがな を iPadの地球儀キーとして送る。
+# Ctrl+SpaceはTermius等のアプリに取られ、英数/かな(LANG2/1)はUS配列設定のiPadでは無視されたため
+CONSUMER = {94: 0x029D, 92: 0x029D, 93: 0x029D}
+MODBITS = {29: 0x01, 42: 0x02, 56: 0x04, 125: 0x08, 97: 0x10, 54: 0x20, 100: 0x40, 126: 0x80}
+GPIO_KEYS = {54, 56}  # gpio-keysから拾うキー(右シフト・左Alt)。電源ボタン(116)は送らない
+
+
+def log(*a):
+    print(*a, flush=True)
+
+
+class Agent(dbus.service.Object):
+    """ペアリング時の確認をすべて自動承認する(ペアリング待ちの間だけ登録される相手に限られる)"""
+    I = "org.bluez.Agent1"
+
+    @dbus.service.method(I, in_signature="", out_signature="")
+    def Release(self): pass
+
+    @dbus.service.method(I, in_signature="os", out_signature="")
+    def AuthorizeService(self, device, uuid): pass
+
+    @dbus.service.method(I, in_signature="o", out_signature="s")
+    def RequestPinCode(self, device): return "0000"
+
+    @dbus.service.method(I, in_signature="o", out_signature="u")
+    def RequestPasskey(self, device): return dbus.UInt32(0)
+
+    @dbus.service.method(I, in_signature="ouq", out_signature="")
+    def DisplayPasskey(self, device, passkey, entered): pass
+
+    @dbus.service.method(I, in_signature="os", out_signature="")
+    def DisplayPinCode(self, device, pincode): pass
+
+    @dbus.service.method(I, in_signature="ou", out_signature="")
+    def RequestConfirmation(self, device, passkey): pass
+
+    @dbus.service.method(I, in_signature="o", out_signature="")
+    def RequestAuthorization(self, device): pass
+
+    @dbus.service.method(I, in_signature="", out_signature="")
+    def Cancel(self): pass
+
+
+class Profile(dbus.service.Object):
+    I = "org.bluez.Profile1"
+
+    @dbus.service.method(I, in_signature="", out_signature="")
+    def Release(self): pass
+
+    @dbus.service.method(I, in_signature="oha{sv}", out_signature="")
+    def NewConnection(self, device, fd, props):
+        os.close(fd.take())  # 実際の接続はL2CAPソケットで受ける
+
+    @dbus.service.method(I, in_signature="o", out_signature="")
+    def RequestDisconnection(self, device): pass
+
+
+class Keyboard:
+    def __init__(self, bus):
+        self.bus = bus
+        self.mode = "local"
+        self.ctrl = self.intr = None
+        self.host = None
+        self.evfd = None
+        self.evwatch = None
+        self.gpiofd = None
+        self.gpiowatch = None
+        self.mods = 0
+        self.keys = []
+        self.pairing_until = 0
+        self.connecting = False
+        self.saved_brightness = None
+        self.wifi_off = False
+        os.makedirs(RUN, exist_ok=True)
+        os.makedirs(os.path.dirname(HOST_FILE), exist_ok=True)
+        try:
+            self.host = open(HOST_FILE).read().strip() or None
+        except OSError:
+            pass
+        self.adapter = dbus.Interface(bus.get_object("org.bluez", "/org/bluez/hci0"),
+                                      "org.freedesktop.DBus.Properties")
+
+    # ---------------------------------------------------------------- 状態
+    def write_state(self):
+        if time.time() < self.pairing_until:
+            s = "BT:ペアリング待ち"
+        elif self.mode == "local":
+            s = "BT:-" if not self.intr else "BT:接続(ポメラ)"
+        else:
+            s = "BT:送信中" if self.intr else "BT:接続待ち"
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            f.write(s + "\n")
+        os.replace(tmp, STATE_FILE)
+        self.update_screen()
+
+    # ---------------------------------------------------------------- L2CAP
+    def listen(self):
+        for psm, attr in ((PSM_CTRL, "lctrl"), (PSM_INTR, "lintr")):
+            s = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET, socket.BTPROTO_L2CAP)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((socket.BDADDR_ANY, psm))
+            s.listen(1)
+            setattr(self, attr, s)
+            GLib.io_add_watch(s.fileno(), GLib.IO_IN, self.on_accept, psm)
+
+    def on_accept(self, fd, cond, psm):
+        lsock = self.lctrl if psm == PSM_CTRL else self.lintr
+        conn, addr = lsock.accept()
+        log("accepted", hex(psm), addr)
+        self.attach(conn, psm, addr[0])
+        return True
+
+    def attach(self, conn, psm, addr):
+        log("connected", hex(psm), addr)
+        if psm == PSM_CTRL:
+            if self.ctrl:
+                self.ctrl.close()
+            self.ctrl = conn
+            GLib.io_add_watch(conn.fileno(), GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, self.on_ctrl)
+        else:
+            if self.intr:
+                self.intr.close()
+            self.intr = conn
+            GLib.io_add_watch(conn.fileno(), GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, self.on_intr)
+            self.host = addr
+            with open(HOST_FILE, "w") as f:
+                f.write(addr + "\n")
+            self.pairing_until = 0
+            self.set_discoverable(False)
+        self.write_state()
+
+    def on_ctrl(self, fd, cond):
+        try:
+            data = self.ctrl.recv(64) if self.ctrl else b""
+        except OSError:
+            data = b""
+        if not data:
+            self.drop()
+            return False
+        t = data[0] >> 4
+        if t == 0x4:  # GET_REPORT
+            self.ctrl.send(bytes([0xA1, 0x01, self.mods, 0]) + bytes(self.keys + [0] * (6 - len(self.keys))))
+        elif t in (0x5, 0x7):  # SET_REPORT / SET_PROTOCOL
+            self.ctrl.send(b"\x00")
+        elif t == 0x1 and (data[0] & 0x0F) == 0x5:  # VIRTUAL_CABLE_UNPLUG
+            self.drop()
+            return False
+        return True
+
+    def on_intr(self, fd, cond):
+        try:
+            data = self.intr.recv(64) if self.intr else b""
+        except OSError:
+            data = b""
+        if not data:
+            self.drop()
+            return False
+        return True  # LED等の出力レポートは無視
+
+    def drop(self):
+        log("disconnected")
+        for a in ("ctrl", "intr"):
+            s = getattr(self, a)
+            if s:
+                try:
+                    s.close()
+                except OSError:
+                    pass
+            setattr(self, a, None)
+        self.mods, self.keys = 0, []
+        self.write_state()
+
+    def connect_host(self):
+        """remoteモードで未接続なら、前回の相手へこちらから接続しにいく"""
+        if self.connecting or self.intr or not self.host:
+            return
+        self.connecting = True
+
+        def work():
+            socks = []
+            try:
+                for psm in (PSM_CTRL, PSM_INTR):
+                    s = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET, socket.BTPROTO_L2CAP)
+                    s.settimeout(8)
+                    s.connect((self.host, psm))
+                    s.settimeout(None)
+                    socks.append((s, psm))
+                for s, psm in socks:
+                    GLib.idle_add(self.attach, s, psm, self.host)
+            except OSError as e:
+                log("connect failed", self.host, e)
+                for s, _ in socks:
+                    s.close()
+                if getattr(e, "errno", None) == 13:  # 認証拒否=相手がペアリングを解除済み。記録を消す
+                    log("forget host", self.host)
+                    self.host = None
+                    try:
+                        os.remove(HOST_FILE)
+                    except OSError:
+                        pass
+            finally:
+                self.connecting = False
+        threading.Thread(target=work, daemon=True).start()
+
+    # ---------------------------------------------------------------- 入力
+    @staticmethod
+    def find_device(devname):
+        name = None
+        for block in open("/proc/bus/input/devices").read().split("\n\n"):
+            if 'N: Name="%s"' % devname in block:
+                for line in block.splitlines():
+                    if line.startswith("H: Handlers="):
+                        for h in line.split("=", 1)[1].split():
+                            if h.startswith("event"):
+                                name = "/dev/input/" + h
+        return name
+
+    def grab(self, on):
+        if on and self.evfd is None:
+            dev = self.find_device("keyd virtual keyboard")
+            if not dev:
+                log("keyd virtual keyboard not found")
+                return False
+            self.evfd = os.open(dev, os.O_RDONLY | os.O_NONBLOCK)
+            fcntl.ioctl(self.evfd, EVIOCGRAB, 1)
+            self.evwatch = GLib.io_add_watch(self.evfd, GLib.IO_IN, self.on_event)
+            # 右シフト(54)と左Alt(56)はキーボード本体ではなくgpio-keys(電源ボタンと同じ回路)から来るので
+            # そちらも読む。電源ボタンをlogindから奪わないよう独占はしない
+            gdev = self.find_device("gpio-keys")
+            if gdev:
+                self.gpiofd = os.open(gdev, os.O_RDONLY | os.O_NONBLOCK)
+                self.gpiowatch = GLib.io_add_watch(self.gpiofd, GLib.IO_IN, self.on_event, GPIO_KEYS)
+        elif not on and self.evfd is not None:
+            GLib.source_remove(self.evwatch)
+            try:
+                fcntl.ioctl(self.evfd, EVIOCGRAB, 0)
+            except OSError:
+                pass
+            os.close(self.evfd)
+            self.evfd = None
+            if self.gpiofd is not None:
+                GLib.source_remove(self.gpiowatch)
+                os.close(self.gpiofd)
+                self.gpiofd = None
+            self.mods, self.keys = 0, []
+            self.send()
+        return True
+
+    def on_event(self, fd, cond, only=None):
+        size = struct.calcsize("llHHi")
+        while True:
+            try:
+                data = os.read(fd, size * 32)
+            except BlockingIOError:
+                break
+            if not data:
+                break
+            for off in range(0, len(data) - size + 1, size):
+                _, _, etype, code, value = struct.unpack_from("llHHi", data, off)
+                if etype != 1 or value == 2:  # EV_KEY以外とキーリピートは無視(相手側でリピートさせる)
+                    continue
+                if only is not None and code not in only:
+                    continue
+                self.key(code, value == 1)
+        return True
+
+    def key(self, code, down):
+        if os.path.exists(RUN + "/debug"):  # touch /run/pomera-btkbd/debug で送信キーを記録
+            log("key", code, "down" if down else "up", hex(KEYMAP.get(code, MODBITS.get(code, CONSUMER.get(code, 0)))))
+        if code in CONSUMER:
+            u = CONSUMER[code] if down else 0
+            if self.intr:
+                try:
+                    self.intr.send(bytes([0xA1, 0x02, u & 0xFF, u >> 8]))
+                except OSError:
+                    self.drop()
+            return
+        if code in MODBITS:
+            if down:
+                self.mods |= MODBITS[code]
+            else:
+                self.mods &= ~MODBITS[code]
+        elif code in KEYMAP:
+            u = KEYMAP[code]
+            if down and u not in self.keys and len(self.keys) < 6:
+                self.keys.append(u)
+            elif not down and u in self.keys:
+                self.keys.remove(u)
+        else:
+            return
+        self.send()
+
+    def send(self):
+        if not self.intr:
+            return
+        report = bytes([0xA1, 0x01, self.mods, 0]) + bytes(self.keys + [0] * (6 - len(self.keys)))
+        try:
+            self.intr.send(report)
+        except OSError:
+            self.drop()
+
+    # ---------------------------------------------------------------- 操作
+    def set_discoverable(self, on):
+        A = "org.bluez.Adapter1"
+        self.adapter.Set(A, "Pairable", dbus.Boolean(on))
+        self.adapter.Set(A, "Discoverable", dbus.Boolean(on))
+        if on:
+            self.adapter.Set(A, "DiscoverableTimeout", dbus.UInt32(PAIR_SECONDS))
+            # 市販キーボード同様、機器クラスを0x002540(限定検出ビット+周辺機器/キーボード)にする。
+            # 音声機能を止めて機器クラスの補足ビットが無くなった後、これが無いとiPadの一覧に出なかった。
+            # btmgmtは端末の無い環境だと戻ってこない(入力が止まった)ので、すぐ終わるhciconfigを使う
+            try:
+                subprocess.run(["hciconfig", "hci0", "class", "0x002540"], timeout=5,
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+            except (OSError, subprocess.SubprocessError) as e:
+                log("hciconfig", e)
+
+    def screen(self, on):
+        """送信中は画面を消して電池を節約する。
+        bl_power(電源断)だと入力が止まったので、明るさを0にするだけにして、元の明るさを覚えて戻す"""
+        bl = "/sys/class/backlight/backlight/brightness"
+        try:
+            if on and self.saved_brightness is not None:
+                with open(bl, "w") as f:
+                    f.write(self.saved_brightness)
+                self.saved_brightness = None
+            elif not on and self.saved_brightness is None:
+                self.saved_brightness = open(bl).read().strip()
+                with open(SAVED_BL, "w") as f:  # 異常終了時にExecStopPostで戻す用
+                    f.write(self.saved_brightness + "\n")
+                with open(bl, "w") as f:
+                    f.write("0")
+        except OSError as e:
+            log("backlight", e)
+
+    def wifi(self, on):
+        """送信中はWi-Fiも切る(電池節約)。BTと同じチップなので電源断ではなくrfkill(nmcli radio)で止める"""
+        if self.wifi_off == (not on):
+            return
+        try:
+            subprocess.run(["nmcli", "radio", "wifi", "on" if on else "off"], check=True, timeout=15)
+            self.wifi_off = not on
+            log("wifi", "on" if on else "off")
+        except (OSError, subprocess.SubprocessError) as e:
+            log("wifi", e)
+
+    def update_screen(self):
+        sending = bool(self.mode == "remote" and self.intr and time.time() >= self.pairing_until)
+        self.screen(not sending)
+        # デバッグ中(/run/pomera-btkbd/debug がある)はSSHで様子を見られるようWi-Fiを残す
+        self.wifi(not sending or os.path.exists(RUN + "/debug"))
+
+    def command(self, cmd):
+        log("command", cmd)
+        if cmd == "pair":
+            self.pairing_until = time.time() + PAIR_SECONDS
+            self.set_discoverable(True)
+            GLib.timeout_add_seconds(PAIR_SECONDS + 1, self.write_state)
+            cmd = "remote"
+        if cmd == "toggle":
+            cmd = "local" if self.mode == "remote" else "remote"
+        if cmd == "remote":
+            if self.grab(True):
+                self.mode = "remote"
+                self.connect_host()
+        elif cmd == "local":
+            self.grab(False)
+            self.mode = "local"
+        self.write_state()
+
+    def open_fifo(self):
+        if not os.path.exists(CMD_FIFO):
+            os.mkfifo(CMD_FIFO)
+        os.chmod(CMD_FIFO, 0o666)  # 一般ユーザーのbtkbdコマンドからも操作できるように
+        fd = os.open(CMD_FIFO, os.O_RDONLY | os.O_NONBLOCK)
+        GLib.io_add_watch(fd, GLib.IO_IN | GLib.IO_HUP, self.on_fifo)
+
+    def on_fifo(self, fd, cond):
+        data = b""
+        try:
+            data = os.read(fd, 256)
+        except BlockingIOError:
+            pass
+        for line in data.decode(errors="ignore").split():
+            self.command(line.strip())
+        if cond & GLib.IO_HUP and not data:
+            os.close(fd)
+            self.open_fifo()
+            return False
+        return True
+
+
+def main():
+    DBusGMainLoop(set_as_default=True)
+    bus = dbus.SystemBus()
+    kb = Keyboard(bus)
+    kb.adapter.Set("org.bluez.Adapter1", "Powered", dbus.Boolean(True))
+
+    agent = Agent(bus, "/pomera/btkbd/agent")
+    am = dbus.Interface(bus.get_object("org.bluez", "/org/bluez"), "org.bluez.AgentManager1")
+    am.RegisterAgent("/pomera/btkbd/agent", "NoInputNoOutput")
+    am.RequestDefaultAgent("/pomera/btkbd/agent")
+
+    profile = Profile(bus, "/pomera/btkbd/profile")
+    pm = dbus.Interface(bus.get_object("org.bluez", "/org/bluez"), "org.bluez.ProfileManager1")
+    pm.RegisterProfile("/pomera/btkbd/profile", "00001124-0000-1000-8000-00805f9b34fb", {
+        "ServiceRecord": SDP_RECORD, "Role": "server",
+        "RequireAuthentication": dbus.Boolean(True), "RequireAuthorization": dbus.Boolean(False),
+    })
+
+    kb.listen()
+    kb.open_fifo()
+
+    def retry():
+        # 送信モードで未接続なら、前回の相手へ5秒ごとに接続を試す(相手側の表示が「接続済み」でも
+        # キーボード用の通信路が無いことがあったため)
+        if kb.mode == "remote" and not kb.intr:
+            kb.connect_host()
+        return True
+    GLib.timeout_add_seconds(5, retry)
+    kb.set_discoverable(False)
+    kb.write_state()
+    log("pomera-btkbd ready, last host:", kb.host)
+    GLib.MainLoop().run()
+
+
+if __name__ == "__main__":
+    main()

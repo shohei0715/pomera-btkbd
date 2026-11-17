@@ -1,0 +1,15 @@
+[Unit]
+Description=Pomera Bluetooth keyboard (大西配列のまま他端末へ送る)
+After=bluetooth.service keyd.service
+Requires=bluetooth.service
+
+[Service]
+ExecStart=/usr/local/sbin/pomera-btkbd
+# 送信モード中に止まっても画面とWi-Fiが切れたままにならないよう戻す
+ExecStopPost=/usr/bin/nmcli radio wifi on
+ExecStopPost=/bin/sh -c 'f=/run/pomera-btkbd/brightness; [ -s $f ] && cat $f > /sys/class/backlight/backlight/brightness && rm -f $f; echo 0 > /sys/class/backlight/backlight/bl_power'
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
