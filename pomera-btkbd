@@ -195,6 +195,9 @@ class Keyboard:
 
     def attach(self, conn, psm, addr):
         log("connected", hex(psm), addr)
+        # 相手が受け取らないときにsendで固まらないよう非ブロッキングにする
+        # (Windows接続時に約70秒デーモンが止まり、操作キーも効かなくなった)
+        conn.setblocking(False)
         if psm == PSM_CTRL:
             if self.ctrl:
                 self.ctrl.close()
@@ -215,24 +218,42 @@ class Keyboard:
     def on_ctrl(self, fd, cond):
         try:
             data = self.ctrl.recv(64) if self.ctrl else b""
+        except BlockingIOError:
+            return True  # 非ブロッキングなので、まだ届いていないだけ
         except OSError:
             data = b""
         if not data:
             self.drop()
             return False
+        # HIDPの制御チャネル。WindowsはSET_IDLE等を送ってきて、返事が無いと入力を受け取らない
+        # (iPadは送ってこないので最初は未対応でも動いた)
         t = data[0] >> 4
         if t == 0x4:  # GET_REPORT
-            self.ctrl.send(bytes([0xA1, 0x01, self.mods, 0]) + bytes(self.keys + [0] * (6 - len(self.keys))))
-        elif t in (0x5, 0x7):  # SET_REPORT / SET_PROTOCOL
-            self.ctrl.send(b"\x00")
-        elif t == 0x1 and (data[0] & 0x0F) == 0x5:  # VIRTUAL_CABLE_UNPLUG
-            self.drop()
-            return False
+            reply = bytes([0xA1, 0x01, self.mods, 0]) + bytes(self.keys + [0] * (6 - len(self.keys)))
+        elif t == 0x6:  # GET_PROTOCOL -> レポートプロトコル(1)
+            reply = b"\xA0\x01"
+        elif t == 0x8:  # GET_IDLE -> 0(変化時のみ送信)
+            reply = b"\xA0\x00"
+        elif t in (0x5, 0x7, 0x9):  # SET_REPORT / SET_PROTOCOL / SET_IDLE -> HANDSHAKE成功
+            reply = b"\x00"
+        elif t == 0x1:  # HID_CONTROL
+            if (data[0] & 0x0F) == 0x5:  # VIRTUAL_CABLE_UNPLUG
+                self.drop()
+                return False
+            return True
+        else:  # 未対応 -> HANDSHAKE ERR_UNSUPPORTED_REQUEST
+            reply = b"\x03"
+        try:
+            self.ctrl.send(reply)
+        except OSError as e:
+            log("ctrl send", e)
         return True
 
     def on_intr(self, fd, cond):
         try:
             data = self.intr.recv(64) if self.intr else b""
+        except BlockingIOError:
+            return True  # 非ブロッキングなので、まだ届いていないだけ
         except OSError:
             data = b""
         if not data:
@@ -355,6 +376,8 @@ class Keyboard:
             if self.intr:
                 try:
                     self.intr.send(bytes([0xA1, 0x02, u & 0xFF, u >> 8]))
+                except BlockingIOError:
+                    log("send dropped (相手が受け取っていない)")
                 except OSError:
                     self.drop()
             return
@@ -379,6 +402,8 @@ class Keyboard:
         report = bytes([0xA1, 0x01, self.mods, 0]) + bytes(self.keys + [0] * (6 - len(self.keys)))
         try:
             self.intr.send(report)
+        except BlockingIOError:
+            log("send dropped (相手が受け取っていない)")
         except OSError:
             self.drop()
 
@@ -445,7 +470,8 @@ class Keyboard:
         if cmd == "remote":
             if self.grab(True):
                 self.mode = "remote"
-                self.connect_host()
+                if time.time() >= self.pairing_until:
+                    self.connect_host()
         elif cmd == "local":
             self.grab(False)
             self.mode = "local"
@@ -491,13 +517,29 @@ def main():
         "RequireAuthentication": dbus.Boolean(True), "RequireAuthorization": dbus.Boolean(False),
     })
 
+    def on_props(iface, changed, invalidated, path=None):
+        # ペアリング待ち中に新しい相手とペアリングできたら、その相手を接続先にしてこちらから接続する
+        # (相手からHIDの通信路を開いてこない場合があるため)
+        if iface == "org.bluez.Device1" and changed.get("Paired") and time.time() < kb.pairing_until:
+            addr = str(bus.get_object("org.bluez", path).Get(
+                "org.bluez.Device1", "Address", dbus_interface="org.freedesktop.DBus.Properties"))
+            log("paired", addr)
+            kb.host = addr
+            kb.pairing_until = 0
+            kb.set_discoverable(False)
+            GLib.timeout_add_seconds(2, lambda: (kb.connect_host(), False)[1])
+            kb.write_state()
+    bus.add_signal_receiver(on_props, signal_name="PropertiesChanged",
+                            dbus_interface="org.freedesktop.DBus.Properties", path_keyword="path")
+
     kb.listen()
     kb.open_fifo()
 
     def retry():
         # 送信モードで未接続なら、前回の相手へ5秒ごとに接続を試す(相手側の表示が「接続済み」でも
         # キーボード用の通信路が無いことがあったため)
-        if kb.mode == "remote" and not kb.intr:
+        # ペアリング待ちの間は試さない(電波を使い続けて、新しい相手から見つけてもらえなくなる)
+        if kb.mode == "remote" and not kb.intr and time.time() >= kb.pairing_until:
             kb.connect_host()
         return True
     GLib.timeout_add_seconds(5, retry)
